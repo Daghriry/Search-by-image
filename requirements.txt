@@ -1,0 +1,13 @@
+# GUI Framework
+PyQt5==5.15.9
+
+# Deep Learning and Image Processing
+torch==2.2.0
+torchvision==0.17.0
+Pillow==10.2.0
+
+# Scientific Computing
+numpy==1.24.3
+
+# Packaging
+pyinstaller==6.3.0

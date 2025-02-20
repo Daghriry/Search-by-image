@@ -5,10 +5,11 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel,
                            QVBoxLayout, QHBoxLayout, QWidget, QFileDialog, 
                            QProgressBar, QTableWidget, QTableWidgetItem, QMessageBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-import torch
-import torchvision.transforms as transforms
-from PIL import Image
+from PyQt5.QtGui import QIcon
+from PyQt5.QtWinExtras import QtWin
+import cv2
 import numpy as np
+
 
 class ImageProcessor(QThread):
     progress_updated = pyqtSignal(int)
@@ -21,46 +22,45 @@ class ImageProcessor(QThread):
         self.modified_image_path = modified_image_path
         self.folder_path = folder_path
         self.output_folder = output_folder
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        self.transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
+        self.target_size = (224, 224)  # Standard size for comparison
 
-    def load_and_preprocess_image(self, image_path):
+    def preprocess_image(self, image_path):
+        """Load and preprocess image for comparison"""
         try:
-            with Image.open(image_path).convert('RGB') as img:
-                tensor = self.transform(img).unsqueeze(0)
-                return tensor.to(self.device)
+            # Read image
+            img = cv2.imread(image_path)
+            if img is None:
+                return None
+            
+            # Resize
+            img = cv2.resize(img, self.target_size)
+            
+            # Convert to grayscale for better comparison
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            return gray
         except Exception as e:
-            self.error_occurred.emit(f"Error loading image {image_path}: {str(e)}")
+            self.error_occurred.emit(f"Error preprocessing image {image_path}: {str(e)}")
             return None
 
-    def compute_similarity(self, img1_tensor, img2_tensor):
+    def compute_similarity(self, img1, img2):
+        """Compute similarity between two images using multiple metrics"""
         try:
-            img1_tensor = img1_tensor.to(self.device)
-            img2_tensor = img2_tensor.to(self.device)
+            # Compute structural similarity (SSIM)
+            score = cv2.matchTemplate(img1, img2, cv2.TM_CCOEFF_NORMED)[0][0]
             
-            img1_flat = img1_tensor.view(img1_tensor.size(0), -1)
-            img2_flat = img2_tensor.view(img2_tensor.size(0), -1)
+            # Normalize score to 0-1 range
+            score = (score + 1) / 2
             
-            similarity = torch.nn.functional.cosine_similarity(img1_flat, img2_flat)
-            return similarity.item()
+            return score
         except Exception as e:
             self.error_occurred.emit(f"Error computing similarity: {str(e)}")
             return 0.0
 
-    def copy_best_match(self, source_path, similarity_score):
+    def copy_best_match(self, source_path):
+        """Copy the best matching image to output folder"""
         try:
-            # Create output folder if it doesn't exist
             os.makedirs(self.output_folder, exist_ok=True)
-            
-            # Get original filename
             original_filename = os.path.basename(source_path)
             dest_path = os.path.join(self.output_folder, original_filename)
             
@@ -71,52 +71,52 @@ class ImageProcessor(QThread):
                 dest_path = os.path.join(self.output_folder, f"{base}_{counter}{ext}")
                 counter += 1
             
-            # Copy the file
             shutil.copy2(source_path, dest_path)
-            print(f"Copied best match to: {dest_path}")
             return dest_path
         except Exception as e:
             self.error_occurred.emit(f"Error copying file: {str(e)}")
             return None
 
     def run(self):
+        """Main processing function"""
         try:
-            print(f"Loading modified image: {self.modified_image_path}")
-            modified_img_tensor = self.load_and_preprocess_image(self.modified_image_path)
-            if modified_img_tensor is None:
+            # Load and preprocess modified image
+            modified_img = self.preprocess_image(self.modified_image_path)
+            if modified_img is None:
                 raise Exception("Failed to load modified image")
 
             best_match = None
             best_score = -1
             supported_extensions = ('.jpg', '.jpeg', '.png', '.bmp')
             
+            # Get list of image files
             image_files = [f for f in os.listdir(self.folder_path) 
                          if f.lower().endswith(supported_extensions)]
             total_files = len(image_files)
             
             if total_files == 0:
                 raise Exception("No supported images found in the folder")
-
-            print(f"Processing {total_files} images...")
             
+            # Process each image
             for idx, filename in enumerate(image_files):
                 try:
                     current_path = os.path.join(self.folder_path, filename)
                     
+                    # Skip if it's the same file
                     if os.path.abspath(current_path) == os.path.abspath(self.modified_image_path):
                         continue
                     
-                    current_img_tensor = self.load_and_preprocess_image(current_path)
-                    if current_img_tensor is not None:
-                        score = self.compute_similarity(modified_img_tensor, current_img_tensor)
-                        print(f"Comparing with {filename}: score = {score}")
-                        
+                    # Process comparison image
+                    current_img = self.preprocess_image(current_path)
+                    if current_img is not None:
+                        score = self.compute_similarity(modified_img, current_img)
                         self.comparison_update.emit(filename, score)
                         
                         if score > best_score:
                             best_score = score
                             best_match = current_path
                     
+                    # Update progress
                     progress = int((idx + 1) / total_files * 100)
                     self.progress_updated.emit(progress)
                     
@@ -124,10 +124,9 @@ class ImageProcessor(QThread):
                     print(f"Error processing {filename}: {str(e)}")
                     continue
 
+            # Handle results
             if best_match:
-                print(f"Best match found: {best_match} with score {best_score}")
-                # Copy the best match to output folder
-                copied_path = self.copy_best_match(best_match, best_score)
+                copied_path = self.copy_best_match(best_match)
                 if copied_path:
                     self.result_found.emit(copied_path, best_score)
                 else:
@@ -141,17 +140,23 @@ class ImageProcessor(QThread):
 class ImageFinderGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Set app ID for Windows taskbar
+        if hasattr(QtWin, 'setCurrentProcessExplicitAppUserModelID'):
+            QtWin.setCurrentProcessExplicitAppUserModelID('SearchByImage')
         self.initUI()
         
     def initUI(self):
+        """Initialize the user interface"""
         self.setWindowTitle('Search by Image')
         self.setGeometry(100, 100, 800, 600)
+        self.setWindowIcon(QIcon('ico.ico'))
 
+        # Main widget and layout
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
 
-        # Image selection area
+        # Image selection buttons
         btn_layout = QHBoxLayout()
         
         self.btn_select_image = QPushButton('Select Modified Image')
@@ -175,10 +180,6 @@ class ImageFinderGUI(QMainWindow):
         layout.addWidget(self.lbl_image_path)
         layout.addWidget(self.lbl_folder_path)
         layout.addWidget(self.lbl_output_path)
-
-        # Device info
-        self.lbl_device = QLabel(f'Using: {torch.device("cuda" if torch.cuda.is_available() else "cpu")}')
-        layout.addWidget(self.lbl_device)
 
         # Search button
         self.btn_search = QPushButton('Start Search')
@@ -205,7 +206,10 @@ class ImageFinderGUI(QMainWindow):
         self.folder_path = None
         self.output_folder = None
 
+        self.setWindowIcon(QIcon('ico.ico'))  # Set window icon
+
     def select_modified_image(self):
+        """Open file dialog to select the modified image"""
         file_path, _ = QFileDialog.getOpenFileName(
             self, 'Select Modified Image', '',
             'Images (*.png *.jpg *.jpeg *.bmp)'
@@ -216,6 +220,7 @@ class ImageFinderGUI(QMainWindow):
             self.update_search_button()
 
     def select_folder(self):
+        """Open folder dialog to select the search directory"""
         folder_path = QFileDialog.getExistingDirectory(
             self, 'Select Search Folder'
         )
@@ -225,6 +230,7 @@ class ImageFinderGUI(QMainWindow):
             self.update_search_button()
 
     def select_output_folder(self):
+        """Open folder dialog to select the output directory"""
         folder_path = QFileDialog.getExistingDirectory(
             self, 'Select Output Folder'
         )
@@ -234,11 +240,13 @@ class ImageFinderGUI(QMainWindow):
             self.update_search_button()
 
     def update_search_button(self):
+        """Enable search button if all paths are selected"""
         self.btn_search.setEnabled(
             bool(self.modified_image_path and self.folder_path and self.output_folder)
         )
 
     def start_search(self):
+        """Initialize and start the image processing thread"""
         self.results_table.setRowCount(0)
         self.progress_bar.setValue(0)
         self.btn_search.setEnabled(False)
@@ -252,23 +260,28 @@ class ImageFinderGUI(QMainWindow):
         self.processor.start()
 
     def update_progress(self, value):
+        """Update progress bar value"""
         self.progress_bar.setValue(value)
 
     def add_comparison_result(self, filename, score):
+        """Add a new comparison result to the table"""
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
         self.results_table.setItem(row, 0, QTableWidgetItem(filename))
         self.results_table.setItem(row, 1, QTableWidgetItem(f"{score:.4f}"))
 
     def show_best_match(self, path, score):
+        """Display the best matching image path and score"""
         self.lbl_best_match.setText(
             f'Best Match: {path}\nSimilarity Score: {score:.4f}'
         )
 
     def show_error(self, message):
+        """Display error message"""
         QMessageBox.critical(self, "Error", message)
 
     def search_finished(self):
+        """Reset UI state after search completion"""
         self.btn_search.setEnabled(True)
 
 def main():
